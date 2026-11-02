@@ -20,6 +20,8 @@ end
 #    Regime A: Islanded BTM Bridge (No Grid Connection: K_imp = 0, K_exp = 0)
 #    Regime B: Grid-Connected Zero-Export Baseline (K_imp > 0, K_exp = 0)
 #    Regime C: Grid-Connected Export-Enabled / On-Demand Contract (K_imp > 0, K_exp >= 0)
+#    The BTM plant is FIXED in all regimes (150 MW gas, 50 MW solar), so its capital
+#    cost is sunk and excluded; export capacity K_exp is the only investment decision.
 function solve_dc_regime(regime::String)
     model = Model(Gurobi.Optimizer)
     set_silent(model)
@@ -32,8 +34,8 @@ function solve_dc_regime(regime::String)
     c_u1 = 25.0          # Bus 1 Utility Baseload ($/MWh)
     c_u3 = 120.0         # Bus 3 Utility Peaker ($/MWh)
     c_gas = 45.0         # Bus 2 Data Center BTM Gas/LNG marginal cost ($/MWh)
-    cap_gas = 15.0       # Amortized BTM Gas CAPEX ($/MW over horizon)
-    cap_sol = 12.0       # Amortized BTM Solar CAPEX ($/MW over horizon)
+    K_gas = 150.0        # Fixed BTM gas capacity (MW) - bridge plant, sunk cost
+    K_sol = 50.0         # Fixed BTM solar capacity (MW) - bridge plant, sunk cost
     kappa_exp = 10.0     # Amortized Export Interconnection Upgrade cost ($/MW)
 
     # Grid Parameters
@@ -45,9 +47,7 @@ function solve_dc_regime(regime::String)
     @variable(model, 0 <= p_u1[t in T] <= 300.0) # Bus 1 Utility Gen (MW)
     @variable(model, 0 <= p_u3[t in T] <= 200.0) # Bus 3 Peaker Gen (MW)
     
-    # Data Center Sizing & Dispatch Variables at Bus 2
-    @variable(model, 0 <= K_gas <= 150.0)        # Installed BTM Gas Capacity (MW)
-    @variable(model, 0 <= K_sol <= 80.0)         # Installed BTM Solar Capacity (MW)
+    # Data Center Dispatch Variables at Bus 2
     @variable(model, g_gas[t in T] >= 0)         # BTM Gas generation (MW)
     @variable(model, g_sol[t in T] >= 0)         # BTM Solar generation (MW)
     @variable(model, p_imp[t in T] >= 0)         # Grid Import to Data Center (MW)
@@ -65,21 +65,17 @@ function solve_dc_regime(regime::String)
         end
         fix(K_exp, 0.0; force=true)
     elseif regime == "Grid_Zero_Export"
-        fix(K_gas, 150.0; force=true) # Retains BTM fleet built during bridge phase
-        fix(K_sol, 50.0; force=true)
         for t in T
             fix(p_exp[t], 0.0; force=true)
         end
         fix(K_exp, 0.0; force=true)
-    elseif regime == "Grid_Export_Enabled"
-        fix(K_gas, 150.0; force=true) # Retains BTM fleet & unlocks grid export
-        fix(K_sol, 50.0; force=true)
-    end
+    end   # Grid_Export_Enabled: K_exp >= 0 is free; nothing else to fix
 
-    # Objective: Minimize Total System Cost (Utility + Data Center CAPEX/OPEX + Interconnection)
+    # Objective: Minimize Total System Cost (utility + BTM fuel + export capacity).
+    # BTM capital cost is sunk (fixed plant) and therefore not included.
     @objective(model, Min,
         sum(c_u1 * p_u1[t] + c_u3 * p_u3[t] + c_gas * g_gas[t] for t in T) +
-        cap_gas * K_gas + cap_sol * K_sol + kappa_exp * K_exp
+        kappa_exp * K_exp
     )
 
     # Constraints
@@ -104,8 +100,8 @@ function solve_dc_regime(regime::String)
         Regime = fill(regime, 2),
         Period = [1, 2],
         DC_Load_MW = L_dc,
-        K_Gas_MW = fill(round(value(K_gas), digits=1), 2),
-        K_Sol_MW = fill(round(value(K_sol), digits=1), 2),
+        K_Gas_MW = fill(K_gas, 2),
+        K_Sol_MW = fill(K_sol, 2),
         K_Exp_MW = fill(round(value(K_exp), digits=1), 2),
         DC_Gas_Gen = [round(value(g_gas[t]), digits=1) for t in T],
         DC_Sol_Gen = [round(value(g_sol[t]), digits=1) for t in T],

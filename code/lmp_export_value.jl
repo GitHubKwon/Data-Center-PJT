@@ -74,4 +74,31 @@ println("Optimal K_exp is where marginal_value_per_MW falls to kappa_exp for thi
 println(curve)
 CSV.write(joinpath(ROOT, "results", "lmp_july2025_export_value.csv"), curve)
 
-println("\nSaved: results/lmp_breakeven_summary.csv, results/lmp_july2025_export_value.csv")
+# ---------------------------------------------------------------------------
+# 3. Full year with the actual surplus (runs once code/download.jl has created
+#    data/single_dc_profile_year.csv). Joins on UTC to avoid DST problems.
+# ---------------------------------------------------------------------------
+year_profile = joinpath(ROOT, "data", "single_dc_profile_year.csv")
+if isfile(year_profile)
+    dy = CSV.read(year_profile, DataFrame; types = Dict(:Timestamp_UTC => String, :Timestamp_EPT => String))
+    dy.utc = DateTime.(dy.Timestamp_UTC, dateformat"yyyy-mm-ddTHH:MM")
+    yy = innerjoin(yr, select(dy, :utc, :Solar_CF, :DC_Load_MW), on = :utc)
+    yy.surplus = K_GAS .+ K_SOL .* yy.Solar_CF .- yy.DC_Load_MW
+    @printf("\nYear with profile: %d hours matched, surplus %.1f-%.1f MW\n",
+            nrow(yy), minimum(yy.surplus), maximum(yy.surplus))
+    spread_y = max.(yy.total_lmp_rt .- 45.0, 0.0)
+    curve_y = DataFrame(K_exp = Float64[], marginal_value_per_MW_yr = Float64[], total_margin = Float64[])
+    for K in 0.0:5.0:90.0
+        push!(curve_y, (K_exp = K,
+                        marginal_value_per_MW_yr = round(sum(spread_y .* (yy.surplus .>= K)), digits = 0),
+                        total_margin = round(sum(spread_y .* min.(K, max.(yy.surplus, 0.0))), digits = 0)))
+    end
+    println("\n=== Full-year export value curve with actual surplus (c_gas = \$45/MWh) ===")
+    println(curve_y)
+    CSV.write(joinpath(ROOT, "results", "lmp_year_export_value.csv"), curve_y)
+else
+    println("\n(Skipping full-year curve: run code/download.jl first to create data/single_dc_profile_year.csv)")
+end
+
+println("\nSaved: results/lmp_breakeven_summary.csv, results/lmp_july2025_export_value.csv",
+        isfile(year_profile) ? ", results/lmp_year_export_value.csv" : "")

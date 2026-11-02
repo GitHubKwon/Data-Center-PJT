@@ -1,4 +1,4 @@
-using Downloads, JSON3, DataFrames, CSV, PowerModels
+using Downloads, JSON3, DataFrames, CSV, PowerModels, Dates
 
 # Project root = parent of the code/ folder, so the script runs from any directory
 const ROOT = normpath(joinpath(@__DIR__, ".."))
@@ -67,3 +67,56 @@ df_dc = DataFrame(
 
 dc_csv_file = joinpath(ROOT, "data", "single_dc_profile.csv")
 CSV.write(dc_csv_file, df_dc)
+
+# ==============================================================================
+# 4. Year-long weather (Nov 1, 2025 - Oct 31, 2026) to match the PJM LMP year file
+#    Requested in UTC so it joins exactly with the LMP file's datetime_beginning_utc;
+#    local (EPT) time is computed for the utilization profile.
+# ==============================================================================
+year_weather_file = joinpath(ROOT, "data", "ashburn_weather_year_raw.json")
+year_url = "https://archive-api.open-meteo.com/v1/archive?latitude=39.0438&longitude=-77.4874&start_date=2025-11-01&end_date=2026-10-31&hourly=temperature_2m,shortwave_radiation&timezone=GMT"
+Downloads.download(year_url, year_weather_file)
+
+yj      = JSON3.read(read(year_weather_file, String))
+tofloat(v) = v === nothing ? NaN : Float64(v)      # the archive returns null for hours not yet available
+utc_y   = DateTime.(String.(yj.hourly.time), dateformat"yyyy-mm-ddTHH:MM")
+temp_y  = tofloat.(yj.hourly.temperature_2m)
+solar_y = tofloat.(yj.hourly.shortwave_radiation)
+
+ok = .!(isnan.(temp_y) .| isnan.(solar_y))
+n_missing = count(!, ok)
+n_missing > 0 && println("   Warning: dropped $(n_missing) hours with missing weather data")
+utc_y, temp_y, solar_y = utc_y[ok], temp_y[ok], solar_y[ok]
+
+# US Eastern time: EDT (UTC-4) from 2:00 local on the 2nd Sunday of March
+# to 2:00 local on the 1st Sunday of November; EST (UTC-5) otherwise.
+nth_sunday(y, m, n) = (d = Date(y, m, 1); d + Day(mod(7 - dayofweek(d), 7)) + Week(n - 1))
+function eastern_local(utc::DateTime)
+    y = year(utc)
+    dst_start = DateTime(nth_sunday(y, 3, 2)) + Hour(7)   # 2:00 EST = 07:00 UTC
+    dst_end   = DateTime(nth_sunday(y, 11, 1)) + Hour(6)  # 2:00 EDT = 06:00 UTC
+    return utc + Hour(dst_start <= utc < dst_end ? -4 : -5)
+end
+ept_y = eastern_local.(utc_y)
+
+# Same load model as the July profile (Section 4.2)
+u_y   = [0.88 + 0.06 * max(0.0, sin(pi * (hour(t) - 6) / 14)) for t in ept_y]
+pue_y = [1.10 + 0.008 * max(0.0, T - 15.0) for T in temp_y]
+L_y   = round.(P_IT_rated .* u_y .* pue_y, digits=2)
+cf_y  = round.(min.(1.0, solar_y ./ 1000.0), digits=3)
+
+df_year = DataFrame(
+    Hour = 1:length(utc_y),
+    Timestamp_UTC = Dates.format.(utc_y, "yyyy-mm-ddTHH:MM"),
+    Timestamp_EPT = Dates.format.(ept_y, "yyyy-mm-ddTHH:MM"),
+    Temp_C = temp_y,
+    Solar_CF = cf_y,
+    IT_Utilization = round.(u_y, digits=3),
+    Cooling_PUE = round.(pue_y, digits=3),
+    DC_Load_MW = L_y
+)
+year_csv_file = joinpath(ROOT, "data", "single_dc_profile_year.csv")
+CSV.write(year_csv_file, df_year)
+println("4. Saved year-long profile: ", nrow(df_year), " hours (",
+        df_year.Timestamp_EPT[1], " to ", df_year.Timestamp_EPT[end], " EPT), peak load ",
+        maximum(L_y), " MW")

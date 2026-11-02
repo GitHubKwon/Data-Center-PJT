@@ -1,11 +1,14 @@
 using CSV, DataFrames, Dates, Printf
 
+# Project root = parent of the code/ folder, so the script runs from any directory
+const ROOT = normpath(joinpath(@__DIR__, ".."))
+
 # Real-price check: value of BTM export capacity at the ASHBURN 35 kV node
 # (PJM Data Miner 2, rt_hrl_lmps, pnode 34886139, Dominion zone).
 # Price-taker: the data center is paid the observed LMP and does not move it,
 # so these values are upper bounds on what export capacity is worth.
 #
-# Run from the PJT folder:  julia lmp_export_value.jl
+# Run from the PJT folder:  julia code/lmp_export_value.jl
 
 const FMT   = dateformat"m/d/yyyy I:M:S p"
 const K_GAS = 150.0                 # fixed BTM gas capacity (MW)
@@ -27,7 +30,7 @@ end
 # ---------------------------------------------------------------------------
 # 1. Annual break-even export cost (Nov 1, 2025 - Nov 1, 2026)
 # ---------------------------------------------------------------------------
-yr = load_lmp("LMP_Ashburn_Year Long Data.csv")
+yr = load_lmp(joinpath(ROOT, "data", "pjm_lmp", "LMP_Ashburn_Year Long Data.csv"))
 @printf("Year file: %d hours, %s to %s (EPT)\n", nrow(yr), yr.ept[1], yr.ept[end])
 
 summary = DataFrame(c_gas = Float64[], hours_profitable = Int[],
@@ -44,13 +47,13 @@ end
 println("\n=== Annual export margin per MW of export capacity (Ashburn) ===")
 println("(sum over hours of max(LMP - c_gas, 0); compare with annualized kappa_exp)")
 println(summary)
-CSV.write("lmp_breakeven_summary.csv", summary)
+CSV.write(joinpath(ROOT, "results", "lmp_breakeven_summary.csv"), summary)
 
 # ---------------------------------------------------------------------------
 # 2. July 15-19, 2025: export value curve using the actual load profile
 # ---------------------------------------------------------------------------
-jl = load_lmp("LMP_ashburn_July15-21-2025.csv")
-dc = CSV.read("single_dc_profile.csv", DataFrame; types = Dict(:Timestamp => String))
+jl = load_lmp(joinpath(ROOT, "data", "pjm_lmp", "LMP_ashburn_July15-21-2025.csv"))
+dc = CSV.read(joinpath(ROOT, "data", "single_dc_profile.csv"), DataFrame; types = Dict(:Timestamp => String))
 dc.ept = DateTime.(dc.Timestamp, dateformat"yyyy-mm-ddTHH:MM")
 wk = innerjoin(jl, dc, on = :ept)
 wk.surplus = K_GAS .+ K_SOL .* wk.Solar_CF .- wk.DC_Load_MW     # MW available to export
@@ -69,6 +72,6 @@ end
 println("\n=== July 15-19, 2025 export value curve (c_gas = \$45/MWh) ===")
 println("Optimal K_exp is where marginal_value_per_MW falls to kappa_exp for this period.")
 println(curve)
-CSV.write("lmp_july2025_export_value.csv", curve)
+CSV.write(joinpath(ROOT, "results", "lmp_july2025_export_value.csv"), curve)
 
-println("\nSaved: lmp_breakeven_summary.csv, lmp_july2025_export_value.csv")
+println("\nSaved: results/lmp_breakeven_summary.csv, results/lmp_july2025_export_value.csv")

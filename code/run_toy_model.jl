@@ -1,7 +1,10 @@
 using JuMP, Gurobi, DataFrames, CSV, Plots, Printf
 
+# Project root = parent of the code/ folder, so the script runs from any directory
+const ROOT = normpath(joinpath(@__DIR__, ".."))
+
 # 1. Load your empirical Ashburn, VA single data center profile
-df_dc = CSV.read("single_dc_profile.csv", DataFrame)
+df_dc = CSV.read(joinpath(ROOT, "data", "single_dc_profile.csv"), DataFrame)
 
 # Pick 2 representative periods from Day 1:
 # Period 1 = Hour 4 (3:00 AM - Cool night, 0% solar, low grid load)
@@ -120,6 +123,6 @@ df_all = vcat(
     solve_dc_regime("Grid_Export_Enabled")
 )
 
-CSV.write("toy_example_results.csv", df_all)
+CSV.write(joinpath(ROOT, "results", "toy_example_results.csv"), df_all)
 println("\n=== THREE-REGIME TOY MODEL COMPARISON ===")
 println(df_all)

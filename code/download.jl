@@ -1,9 +1,12 @@
 using Downloads, JSON3, DataFrames, CSV, PowerModels
 
+# Project root = parent of the code/ folder, so the script runs from any directory
+const ROOT = normpath(joinpath(@__DIR__, ".."))
+
 # ==============================================================================
 # 1. Download IEEE 14-Bus Grid Topology (with offline fallback)
 # ==============================================================================
-grid_file = "pglib_opf_case14_ieee.m"
+grid_file = joinpath(ROOT, "data", "pglib_opf_case14_ieee.m")
 try
     Downloads.download(
         "https://raw.githubusercontent.com/power-grid-lib/pglib-opf/master/pglib_opf_case14_ieee.m",
@@ -19,7 +22,7 @@ end
 # ==============================================================================
 # 2. Direct Download: Official NREL ATB Cost & Performance Workbook (.xlsx)
 # ==============================================================================
-atb_file = "NREL_ATB_Electricity_Workbook.xlsx"
+atb_file = joinpath(ROOT, "data", "NREL_ATB_Electricity_Workbook.xlsx")
 if !isfile(atb_file)
     atb_url = "https://data.openei.org/files/6006/2024_v4_Workbook_7-22-2026.xlsx"
     Downloads.download(atb_url, atb_file)
@@ -29,7 +32,7 @@ println("2. Verified \$atb_file (", round(filesize(atb_file) / 1e6, digits=2), "
 # ==============================================================================
 # 3. Direct API Pull: Real Hourly Weather & Solar for 1 Data Center (Ashburn, VA)
 # ==============================================================================
-weather_file = "ashburn_weather_raw.json"
+weather_file = joinpath(ROOT, "data", "ashburn_weather_raw.json")
 weather_url = "https://archive-api.open-meteo.com/v1/archive?latitude=39.0438&longitude=-77.4874&start_date=2025-07-15&end_date=2025-07-21&hourly=temperature_2m,shortwave_radiation&timezone=America%2FNew_York"
 Downloads.download(weather_url, weather_file)
 
@@ -62,5 +65,5 @@ df_dc = DataFrame(
     DC_Load_MW = L_dc_mw
 )
 
-dc_csv_file = "single_dc_profile.csv"
+dc_csv_file = joinpath(ROOT, "data", "single_dc_profile.csv")
 CSV.write(dc_csv_file, df_dc)

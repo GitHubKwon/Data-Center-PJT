@@ -3,6 +3,21 @@ using Downloads, JSON3, DataFrames, CSV, PowerModels, Dates
 # Project root = parent of the code/ folder, so the script runs from any directory
 const ROOT = normpath(joinpath(@__DIR__, ".."))
 
+const P_IT_rated = 100.0   # 100 MW single hyperscale campus IT capacity
+
+# US Eastern time: EDT (UTC-4) from 2:00 local on the 2nd Sunday of March
+# to 2:00 local on the 1st Sunday of November; EST (UTC-5) otherwise.
+# Weather is downloaded in UTC and converted here, because Open-Meteo applies the
+# time zone's *current* UTC offset to a whole request (a local-time request made in
+# winter would shift July data by one hour).
+nth_sunday(y, m, n) = (d = Date(y, m, 1); d + Day(mod(7 - dayofweek(d), 7)) + Week(n - 1))
+function eastern_local(utc::DateTime)
+    y = year(utc)
+    dst_start = DateTime(nth_sunday(y, 3, 2)) + Hour(7)   # 2:00 EST = 07:00 UTC
+    dst_end   = DateTime(nth_sunday(y, 11, 1)) + Hour(6)  # 2:00 EDT = 06:00 UTC
+    return utc + Hour(dst_start <= utc < dst_end ? -4 : -5)
+end
+
 # ==============================================================================
 # 1. Download IEEE 14-Bus Grid Topology (with offline fallback)
 # ==============================================================================
@@ -31,50 +46,54 @@ println("2. Verified \$atb_file (", round(filesize(atb_file) / 1e6, digits=2), "
 
 # ==============================================================================
 # 3. Direct API Pull: Real Hourly Weather & Solar for 1 Data Center (Ashburn, VA)
+#    July 15-21, 2025 in local time (EDT). Skipped if the profile already exists,
+#    so re-running this script never changes the data used in the report.
 # ==============================================================================
 weather_file = joinpath(ROOT, "data", "ashburn_weather_raw.json")
-weather_url = "https://archive-api.open-meteo.com/v1/archive?latitude=39.0438&longitude=-77.4874&start_date=2025-07-15&end_date=2025-07-21&hourly=temperature_2m,shortwave_radiation&timezone=America%2FNew_York"
-Downloads.download(weather_url, weather_file)
+dc_csv_file  = joinpath(ROOT, "data", "single_dc_profile.csv")
+if isfile(dc_csv_file)
+    println("3. Kept existing ", dc_csv_file, " (delete it to re-download and rebuild)")
+else
+    weather_url = "https://archive-api.open-meteo.com/v1/archive?latitude=39.0438&longitude=-77.4874&start_date=2025-07-14&end_date=2025-07-22&hourly=temperature_2m,shortwave_radiation&timezone=GMT"
+    Downloads.download(weather_url, weather_file)
 
-raw_json   = JSON3.read(read(weather_file, String))
-timestamps = String.(raw_json.hourly.time)
-temp_c     = Float64.(raw_json.hourly.temperature_2m)
-solar_wm2  = Float64.(raw_json.hourly.shortwave_radiation)
+    raw_json  = JSON3.read(read(weather_file, String))
+    utc_w     = DateTime.(String.(raw_json.hourly.time), dateformat"yyyy-mm-ddTHH:MM")
+    ept_w     = eastern_local.(utc_w)
+    keep      = DateTime(2025, 7, 15, 0) .<= ept_w .<= DateTime(2025, 7, 21, 23)
+    ept_w     = ept_w[keep]
+    temp_c    = Float64.(raw_json.hourly.temperature_2m)[keep]
+    solar_wm2 = Float64.(raw_json.hourly.shortwave_radiation)[keep]
+    T_hours   = length(ept_w)
 
-# Construct 100 MW IT Single Data Center Load Profile + On-Site Solar CF
-T_hours    = length(timestamps)
-P_IT_rated = 100.0 # 100 MW single hyperscale campus IT capacity
+    # Server utilization (88% baseload + 6% daytime inference peak), by local hour
+    u_it = [0.88 + 0.06 * max(0.0, sin(pi * (hour(t) - 6) / 14)) for t in ept_w]
+    # Cooling PUE driven by real Ashburn, VA hourly temperature
+    pue  = [1.10 + 0.008 * max(0.0, T - 15.0) for T in temp_c]
+    # Total Data Center Power Requirement (MW) & Solar Capacity Factor [0, 1]
+    L_dc_mw  = round.(P_IT_rated .* u_it .* pue, digits=2)
+    cf_solar = round.(min.(1.0, solar_wm2 ./ 1000.0), digits=3)
 
-# Server utilization (88% baseload + 6% daytime inference peak)
-u_it = [0.88 + 0.06 * max(0.0, sin(pi * (mod(t-1, 24) - 6) / 14)) for t in 1:T_hours]
-
-# Cooling PUE driven by real Ashburn, VA hourly temperature
-pue = [1.10 + 0.008 * max(0.0, temp_c[t] - 15.0) for t in 1:T_hours]
-
-# Total Data Center Power Requirement (MW) & Solar Capacity Factor [0, 1]
-L_dc_mw  = [round(P_IT_rated * u_it[t] * pue[t], digits=2) for t in 1:T_hours]
-cf_solar = [round(min(1.0, solar_wm2[t] / 1000.0), digits=3) for t in 1:T_hours]
-
-df_dc = DataFrame(
-    Hour = 1:T_hours,
-    Timestamp = timestamps,
-    Temp_C = temp_c,
-    Solar_CF = cf_solar,
-    IT_Utilization = round.(u_it, digits=3),
-    Cooling_PUE = round.(pue, digits=3),
-    DC_Load_MW = L_dc_mw
-)
-
-dc_csv_file = joinpath(ROOT, "data", "single_dc_profile.csv")
-CSV.write(dc_csv_file, df_dc)
+    df_dc = DataFrame(
+        Hour = 1:T_hours,
+        Timestamp = Dates.format.(ept_w, "yyyy-mm-ddTHH:MM"),
+        Temp_C = temp_c,
+        Solar_CF = cf_solar,
+        IT_Utilization = round.(u_it, digits=3),
+        Cooling_PUE = round.(pue, digits=3),
+        DC_Load_MW = L_dc_mw
+    )
+    CSV.write(dc_csv_file, df_dc)
+    println("3. Rebuilt ", dc_csv_file, ": ", T_hours, " hours")
+end
 
 # ==============================================================================
-# 4. Year-long weather (Nov 1, 2025 - Oct 31, 2026) to match the PJM LMP year file
+# 4. Year-long weather (Nov 1, 2025 - Nov 1, 2026) to match the PJM LMP year file
 #    Requested in UTC so it joins exactly with the LMP file's datetime_beginning_utc;
 #    local (EPT) time is computed for the utilization profile.
 # ==============================================================================
 year_weather_file = joinpath(ROOT, "data", "ashburn_weather_year_raw.json")
-year_url = "https://archive-api.open-meteo.com/v1/archive?latitude=39.0438&longitude=-77.4874&start_date=2025-11-01&end_date=2026-10-31&hourly=temperature_2m,shortwave_radiation&timezone=GMT"
+year_url = "https://archive-api.open-meteo.com/v1/archive?latitude=39.0438&longitude=-77.4874&start_date=2025-11-01&end_date=2026-11-01&hourly=temperature_2m,shortwave_radiation&timezone=GMT"
 Downloads.download(year_url, year_weather_file)
 
 yj      = JSON3.read(read(year_weather_file, String))
@@ -88,15 +107,6 @@ n_missing = count(!, ok)
 n_missing > 0 && println("   Warning: dropped $(n_missing) hours with missing weather data")
 utc_y, temp_y, solar_y = utc_y[ok], temp_y[ok], solar_y[ok]
 
-# US Eastern time: EDT (UTC-4) from 2:00 local on the 2nd Sunday of March
-# to 2:00 local on the 1st Sunday of November; EST (UTC-5) otherwise.
-nth_sunday(y, m, n) = (d = Date(y, m, 1); d + Day(mod(7 - dayofweek(d), 7)) + Week(n - 1))
-function eastern_local(utc::DateTime)
-    y = year(utc)
-    dst_start = DateTime(nth_sunday(y, 3, 2)) + Hour(7)   # 2:00 EST = 07:00 UTC
-    dst_end   = DateTime(nth_sunday(y, 11, 1)) + Hour(6)  # 2:00 EDT = 06:00 UTC
-    return utc + Hour(dst_start <= utc < dst_end ? -4 : -5)
-end
 ept_y = eastern_local.(utc_y)
 
 # Same load model as the July profile (Section 4.2)

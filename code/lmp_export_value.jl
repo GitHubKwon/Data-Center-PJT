@@ -52,7 +52,9 @@ CSV.write(joinpath(ROOT, "results", "lmp_breakeven_summary.csv"), summary)
 # ---------------------------------------------------------------------------
 # 2. July 15-19, 2025: export value curve using the actual load profile
 # ---------------------------------------------------------------------------
-jl = load_lmp(joinpath(ROOT, "data", "pjm_lmp", "LMP_ashburn_July15-21-2025.csv"))
+jl = load_lmp(joinpath(ROOT, "data", "pjm_lmp", "LMP_ashburn_July14-23-2025.csv"))
+# Keep July 15-19 (120 h) so the curve matches the Appendix 8 results in the report
+jl = jl[(jl.ept .>= DateTime(2025, 7, 15)) .& (jl.ept .< DateTime(2025, 7, 20)), :]
 dc = CSV.read(joinpath(ROOT, "data", "single_dc_profile.csv"), DataFrame; types = Dict(:Timestamp => String))
 dc.ept = DateTime.(dc.Timestamp, dateformat"yyyy-mm-ddTHH:MM")
 wk = innerjoin(jl, dc, on = :ept)

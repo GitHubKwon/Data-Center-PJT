@@ -95,10 +95,21 @@ const X_OHM_PER_MILE = Dict(69 => 0.75, 138 => 0.80)
 # Multiplier on kappa_up (1 = MISO exploratory cost; Northern Virginia is likely higher)
 const KAPPA_MULT_BASE = 1.0
 
-# --- Firm transmission service (PJM OATT, DOM zone NITS rate, CAPS handbook) ----
-const NITS_PER_MW_YR = 75876.81
-const KAPPA_FIRM     = NITS_PER_MW_YR * WEEK          # ~ $1,455/MW for the 168 h week
-const INCLUDE_NITS_BASE = false                         # if true: + KAPPA_FIRM * peak import
+# --- Firm transmission service (PJM OATT, DOM zone NITS rate) -----------------
+# CAPS Transmission Handbook Vol. VI (July 2025), Figure 6: Virginia Electric and Power Co.
+# $75,876.81/MW-yr plus Dominion Underground $541.18/MW-yr
+const NITS_DOM       = 75876.81
+const NITS_DOM_UG    = 541.18
+const NITS_PER_MW_YR = NITS_DOM + NITS_DOM_UG        # $76,417.99/MW-yr
+const KAPPA_FIRM     = NITS_PER_MW_YR * WEEK          # ~ $1,465.55/MW for the 168 h week
+const INCLUDE_NITS_BASE = false                         # if true: + KAPPA_FIRM * billed MW
+# What the NITS charge is billed on:
+# "coincident" (default) = data center import in the DOM zone's peak hour. The zonal peak load
+#   (NSPL) is "metered demand coincident with zonal peak load hour" (CAPS Figure 7), and the
+#   daily charge is PLC x NITS rate / 365 (CAPS p. 11). In this week the DOM peak is
+#   July 17, 2025, 5 PM EPT (23,460.9 MW).
+# "max_hour" = the data center's highest import of the week (non-coincident)
+const NITS_BASIS_BASE = "coincident"
 
 # --- Network congestion knob (scales every rateA) ---------------------------
 # At the PGLib ratings (1.0) the 14-bus case can serve the data center without any upgrade.
@@ -131,6 +142,7 @@ lmp = read_pjm(joinpath(ROOT, "data", "pjm_lmp", "LMP_ashburn_July14-23-2025.csv
 # 1b. PJM metered hourly load, Dominion zone -> hourly shape for regional demand D_i,t
 dom = read_pjm(joinpath(ROOT, "data", "pjm_load", "DOM_hrl_load_metered_July14-22-2025.csv"))
 load_shape = dom.mw ./ maximum(dom.mw)
+const T_PEAK = argmax(dom.mw)                     # DOM zonal peak hour of the week (for NITS)
 # 1c. Data center load and solar capacity factor (Section 4.2)
 dc = CSV.read(joinpath(ROOT, "data", "single_dc_profile.csv"), DataFrame; types = Dict(:Timestamp => String))
 dc.ept = DateTime.(dc.Timestamp, dateformat"yyyy-mm-ddTHH:MM")
@@ -224,6 +236,7 @@ println("=== Inputs ===")
         mean(P_MKT), maximum(P_MKT), C_CC_UTIL, C_PEAKER, C_GAS_BASE)
 @printf("kappa_up: \$%.2f-\$%.2f per MW per week (x%.1f); NITS \$%.2f per MW per week\n",
         minimum(b.kappa for b in BR), maximum(b.kappa for b in BR), KAPPA_MULT_BASE, KAPPA_FIRM)
+@printf("DOM peak hour (NITS billing hour): %s, %.1f MW\n", dom.ept[T_PEAK], dom.mw[T_PEAK])
 @printf("Network: rateA x %.2f; data center at bus %d; solar as load reduction = %s; alpha = %.2f%%\n",
         FMAX_SCALE_BASE, DC_BUS, SOLAR_AS_LOAD_REDUCTION, 100 * ALPHA_BASE)
 
@@ -239,6 +252,7 @@ Base.@kwdef struct Scenario
     fmax_scale::Float64 = FMAX_SCALE_BASE
     co2_cap::Float64   = Inf             # tCO2 over the horizon (Inf = no cap)
     include_nits::Bool = INCLUDE_NITS_BASE
+    nits_basis::String = NITS_BASIS_BASE
     solar_lr::Bool     = SOLAR_AS_LOAD_REDUCTION
 end
 
@@ -258,7 +272,7 @@ function solve(s::Scenario)
     @variable(m, c[t in T] >= 0)                                      # curtailed import
     @variable(m, f[l in LINES, t in T])                               # branch flow
     @variable(m, theta[i in BUSES, t in T])                           # voltage angle
-    @variable(m, K_firm >= 0)                                         # peak import (for NITS)
+    @variable(m, K_firm >= 0)                                         # MW billed for NITS
 
     # Objective: upgrades + utility energy + BTM fuel (+ optional NITS on peak import)
     @objective(m, Min,
@@ -290,8 +304,12 @@ function solve(s::Scenario)
     # Optional carbon cap on BTM gas
     isfinite(s.co2_cap) && @constraint(m, sum(E_GAS * g_gas[t] for t in T) <= s.co2_cap)
 
-    # Peak import (only priced if include_nits)
-    @constraint(m, [t in T], K_firm >= p_imp[t])
+    # MW billed for NITS (only priced if include_nits)
+    if s.nits_basis == "coincident"
+        @constraint(m, K_firm >= p_imp[T_PEAK])
+    else
+        @constraint(m, [t in T], K_firm >= p_imp[t])
+    end
 
     # Regimes
     if s.regime == 'A'
@@ -330,6 +348,7 @@ function solve(s::Scenario)
     return (scenario = s, status = "OPTIMAL", model = m,
             total = objective_value(m), upgrade = upg, utility = util, fuel = fuel,
             nits = s.include_nits ? KAPPA_FIRM * value(K_firm) : 0.0,
+            imp_at_zonal_peak = value(p_imp[T_PEAK]),
             dF = Dict(l => value(dF[l]) for l in LINES),
             dF_total = sum(value(dF[l]) for l in LINES),
             imp = Vector(value.(p_imp)), gas = Vector(value.(g_gas)), sol = Vector(value.(g_sol)),
@@ -350,6 +369,7 @@ function record!(r, sweep, value_label)
     push!(rows, (sweep = sweep, setting = value_label, regime = string(s.regime), status = r.status,
         c_gas = s.c_gas, alpha = s.alpha, kappa_mult = s.kappa_mult, fmax_scale = s.fmax_scale,
         co2_cap_t = isfinite(s.co2_cap) ? round(s.co2_cap, digits = 1) : missing, include_nits = s.include_nits,
+        nits_basis = s.include_nits ? s.nits_basis : missing,
         solar_as_load_reduction = s.solar_lr,
         total_cost = r.status == "OPTIMAL" ? round(r.total, digits = 2) : missing,
         upgrade_cost = r.status == "OPTIMAL" ? round(r.upgrade, digits = 2) : missing,
@@ -358,6 +378,7 @@ function record!(r, sweep, value_label)
         nits_cost = r.status == "OPTIMAL" ? round(r.nits, digits = 2) : missing,
         upgrades_MW = r.status == "OPTIMAL" ? round(r.dF_total, digits = 2) : missing,
         peak_import_MW = r.status == "OPTIMAL" ? round(r.peak_imp, digits = 2) : missing,
+        import_at_DOM_peak_MW = r.status == "OPTIMAL" ? round(r.imp_at_zonal_peak, digits = 2) : missing,
         curtailed_MWh = r.status == "OPTIMAL" ? round(r.curt_MWh, digits = 2) : missing,
         btm_gas_MWh = r.status == "OPTIMAL" ? round(r.gas_MWh, digits = 2) : missing,
         btm_co2_t = r.status == "OPTIMAL" ? round(r.co2, digits = 2) : missing,
@@ -390,7 +411,8 @@ for R in ('A', 'C')                     # carbon cap: half of the uncapped BTM e
     run!("carbon cap", "zero gas"; regime = R, co2_cap = 0.0)
 end
 for R in ('B', 'C')
-    run!("firm service charge (NITS)", "on"; regime = R, include_nits = true)
+    run!("firm service charge (NITS)", "coincident (DOM peak hour)"; regime = R, include_nits = true, nits_basis = "coincident")
+    run!("firm service charge (NITS)", "max hour of week"; regime = R, include_nits = true, nits_basis = "max_hour")
 end
 for R in ('B', 'C')
     run!("solar treatment", "Section 3.5 as written"; regime = R, solar_lr = false)

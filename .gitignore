@@ -1,2 +1,6 @@
-# Word/Office temporary lock files
+# old drafts and editor/OS clutter
+_old/
 ~$*
+.DS_Store
+Thumbs.db
+.vscode/
